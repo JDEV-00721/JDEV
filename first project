@@ -1,0 +1,343 @@
+!pip install ccxt pykalman  
+
+import ccxt
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from pykalman import KalmanFilter
+from statsmodels.tsa.stattools import adfuller, kpss, grangercausalitytests
+from sklearn.preprocessing import PowerTransformer
+
+
+# === EXCHANGE INIT ===
+exchange = ccxt.kucoin()
+
+# === FETCH FUNCTION ===
+def fetch_data(symbol, timeframe='15m', limit=400):
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high','low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
+    return df[['close', 'volume']]   # <--- Include volume here
+
+
+# === CLEANING FUNCTION ===
+def auto_clean(df):
+    df = df.interpolate(method='linear')
+    df = df.fillna(method='ffill')
+    df = df.fillna(method='bfill')
+    return df
+
+# === KALMAN FILTER HEDGE RATIO ESTIMATION ===
+def kalman_filter_hedge_ratio(y, x):
+    # Observation: y[t] = beta * x[t] + intercept + noise
+    delta = 1e-8  # small drift allowed
+    trans_cov = delta / (1 - delta) * np.eye(2)  # transition covariance
+    obs_mat = np.vstack([x, np.ones(len(x))]).T[:, np.newaxis, :]  # [x_t, 1]
+
+    kf = KalmanFilter(
+        transition_matrices=np.eye(2),
+        observation_matrices=obs_mat,
+        initial_state_mean=[0, 0],
+        initial_state_covariance=np.ones((2, 2)),
+        observation_covariance=1.0,
+        transition_covariance=trans_cov
+    )
+
+    state_means, _ = kf.filter(y.values)
+    hedge_ratios = state_means[:, 0]
+    intercepts = state_means[:, 1]
+    return hedge_ratios, intercepts
+
+btc = auto_clean(fetch_data('ETH-USDT'))
+eth = auto_clean(fetch_data('BTC-USDT'))
+
+# Rename columns to avoid clashes:
+btc.rename(columns={'close': 'btc', 'volume': 'btc_volume'}, inplace=True)
+eth.rename(columns={'close': 'eth', 'volume': 'eth_volume'}, inplace=True)
+
+
+
+# Merge on index:
+df = eth.join(btc, how='inner')
+
+
+# Apply Kalman Filter
+hedge_ratios, intercepts = kalman_filter_hedge_ratio(df['eth'], df['btc'])
+
+# Store results in DataFrame
+df['hedge_ratio'] = hedge_ratios
+df['intercept'] = intercepts
+df['spread'] = df['eth'] - (df['hedge_ratio'] * df['btc'] + df['intercept'])
+
+# === PLOT ===
+plt.figure(figsize=(14, 6))
+plt.plot(df.index, df['spread'], label='Kalman Filtered Spread', color='purple')
+plt.axhline(0, color='gray', linestyle='--', alpha=0.6)
+plt.title('Dynamic Spread via Kalman Filter (ETH-BTC)')
+plt.xlabel('Time')
+plt.ylabel('Spread')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+
+
+result = adfuller(df['spread'].dropna())
+print(f'ADF Statistic: {result[0]}')
+print(f'p-value: {result[1]}')
+
+if result[1] < 0.05:
+    print("✅ Likely stationary")
+else:
+    print("❌ Likely non-stationary")
+
+
+stat, p_value, lags, crit = kpss(df['spread'].dropna(), regression='c')
+print(f'KPSS Statistic: {stat}')
+print(f'p-value: {p_value}')
+
+if p_value < 0.05:
+    print("❌ Likely non-stationary")
+else:
+    print("✅ Likely stationary")
+
+# Initialize transformer with Yeo-Johnson method
+pt = PowerTransformer(method='yeo-johnson')
+
+# Reshape data for sklearn (needs 2D array)
+spread_values = df['spread'].values.reshape(-1, 1)
+
+# Fit and transform spread
+spread_transformed = pt.fit_transform(spread_values)
+
+# Store transformed spread back into DataFrame
+df['spread_yt'] = spread_transformed.flatten()
+
+window = 30
+
+df['spread_yt_mean'] = df['spread_yt'].rolling(window=window).mean()
+df['spread_yt_std'] = df['spread_yt'].rolling(window=window).std()
+
+# Avoid division by zero
+df['spread_yt_std_adj'] = df['spread_yt_std'].replace(0, 1e-8)
+
+# Compute z-score on transformed spread
+df['yt_zscore'] = (df['spread_yt'] - df['spread_yt_mean']) / df['spread_yt_std_adj']
+
+z_threshold = 2.0
+exceeding = df[(df['yt_zscore'] > z_threshold) | (df['yt_zscore'] < -z_threshold)]
+
+# Print results
+if not exceeding.empty:
+    print("⚠️ Spread exceeded Z-score threshold:")
+    for timestamp, row in exceeding.iterrows():
+        print(f"{timestamp} — Z-score: {row['yt_zscore']:.2f} — Spread: {row['spread']:.2f}")
+else:
+    print("✅ No Z-score threshold exceedance detected.")
+
+
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(14, 6))
+plt.plot(df.index, df['btc'], label='ETH Price', color='black')
+
+# Plot dislocation markers
+plt.scatter(exceeding.index, exceeding['btc'], color='orange', label='Dislocation', zorder=5)
+
+
+plt.title("Dislocation Map: ETH Price at Kalman Spread Spike Points")
+plt.xlabel("Time")
+plt.ylabel("ETH Price")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# Define implied ETH price (what ETH should be based on BTC and Kalman model)
+df['implied_eth'] = df['hedge_ratio'] * df['btc'] + df['intercept']
+
+# Plotting
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(14, 7))
+
+# Plot actual ETH price
+plt.plot(df.index, df['eth'], label='Actual ETH Price', color='blue')
+
+# Plot implied ETH price (zero spread line)
+plt.plot(df.index, df['implied_eth'], label='Implied ETH Price (Kalman Model)', color='orange', linestyle='--')
+
+# Optional: Highlight dislocations
+plt.title('Actual ETH vs Implied ETH (Kalman Filter)')
+plt.xlabel('Time')
+plt.ylabel('Price')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+
+from scipy.signal import savgol_filter
+
+import matplotlib.pyplot as plt
+
+# === Spread Derivatives ===
+spread = df['spread'].dropna()
+
+# Smooth the spread (already done, just be sure)
+spread_smooth = pd.Series(savgol_filter(spread, window_length=15, polyorder=3), index=spread.index)
+
+# Derivatives
+velocity = spread_smooth.diff().fillna(0)
+acceleration = velocity.diff().fillna(0)
+jerk = acceleration.diff().fillna(0)
+
+# Store in dataframe (optional, for later logic)
+df['spread_smooth'] = spread_smooth
+df['velocity'] = velocity
+df['acceleration'] = acceleration
+df['jerk'] = jerk
+
+# === Plot All Spread Derivatives ===
+fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
+
+# 1. Spread (smoothed)
+axes[0].plot(df.index, spread_smooth, label='Smoothed Spread', color='purple')
+axes[0].set_ylabel('Spread')
+axes[0].legend()
+axes[0].grid(True)
+
+# 2. Velocity
+axes[1].plot(df.index, velocity, label='Velocity (1st Derivative)', color='blue')
+axes[1].axhline(0, linestyle='--', color='gray', alpha=0.5)
+axes[1].set_ylabel('Velocity')
+axes[1].legend()
+axes[1].grid(True)
+
+# 3. Acceleration
+axes[2].plot(df.index, acceleration, label='Acceleration (2nd Derivative)', color='green')
+axes[2].axhline(0, linestyle='--', color='gray', alpha=0.5)
+axes[2].set_ylabel('Acceleration')
+axes[2].legend()
+axes[2].grid(True)
+
+# 4. Jerk
+axes[3].plot(df.index, jerk, label='Jerk (3rd Derivative)', color='red')
+axes[3].axhline(0, linestyle='--', color='gray', alpha=0.5)
+axes[3].set_ylabel('Jerk')
+axes[3].legend()
+axes[3].grid(True)
+
+import numpy as np
+import matplotlib.pyplot as plt
+import numpy as np
+import matplotlib.pyplot as plt
+
+# === Helper: Auto window size ===
+def auto_window(df, fraction=0.05, max_window=100):
+    return min(max(int(len(df) * fraction), 5), max_window)
+
+# === Compute Energies ===
+def compute_energies(df, window=None, normalize=True):
+    df = df.copy()
+
+    if window is None:
+        window = auto_window(df)
+
+    # === Derivatives ===
+    spread = df['spread']
+    jerk = spread.diff().diff().diff().fillna(0)  # 3rd derivative
+    velocity = spread.diff().fillna(0)
+
+    # === Volatility & Spread Magnitude ===
+    spread_mean = spread.rolling(window).mean()
+    volatility = spread.rolling(window).std().replace(0, 1e-8)
+    spread_magnitude = (spread - spread_mean).abs()
+
+    # === Potential Energy ===
+    pe_raw = (spread_magnitude ** 2 / volatility) * jerk.abs()
+
+    # === Kinetic Energy ===
+    # Assume average mass = avg(eth_volume, btc_volume)
+    v = (df['eth_volume'] + df['btc_volume']) / 2
+    ke_raw = 0.5 * v * (velocity ** 2)
+
+    if normalize:
+        pe_mean = pe_raw.rolling(window).mean()
+        pe_std = pe_raw.rolling(window).std().replace(0, 1e-8)
+        pe = (pe_raw - pe_mean) / pe_std
+
+        ke_mean = ke_raw.rolling(window).mean()
+        ke_std = ke_raw.rolling(window).std().replace(0, 1e-8)
+        ke = (ke_raw - ke_mean) / ke_std
+    else:
+        pe, ke = pe_raw, ke_raw
+
+    df['PE'] = pe
+    df['KE'] = ke
+    return df
+
+# === Apply to your DataFrame ===
+df_energies = compute_energies(df)
+
+# === Plotting ===
+plt.figure(figsize=(15, 6))
+plt.plot(df_energies.index, df_energies['PE'], label='Potential Energy (Normalized)', color='purple')
+plt.plot(df_energies.index, df_energies['KE'], label='Kinetic Energy (Normalized)', color='orange', alpha=0.8)
+
+# Threshold annotations
+pe_thresh = 3.0
+ke_thresh = 3.0
+
+pe_exceed = df_energies[df_energies['PE'] > pe_thresh]
+ke_exceed = df_energies[df_energies['KE'] > ke_thresh]
+
+plt.figure(figsize=(14,5))
+plt.plot(df_energies.index, df_energies['PE'], label='Potential Energy (Z-score)', color='purple')
+plt.plot(df_energies.index, df_energies['KE'], label='Kinetic Energy (Z-score)', color='green')
+
+plt.scatter(pe_exceed.index, pe_exceed['PE'], color='red', label='PE > 2', zorder=5)
+plt.scatter(ke_exceed.index, ke_exceed['KE'], color='blue', label='KE > 2', zorder=5)
+
+plt.title('Synchronized Market Energy: Potential & Kinetic (Z-Score Normalized)')
+plt.xlabel('Time')
+plt.ylabel('Z-Score Energy')
+plt.axhline(0, color='gray', linestyle='--', alpha=0.3)
+plt.grid(True, alpha=0.3)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# Output dates and times for PE exceedances
+print("Potential Energy exceedances:")
+for time, row in pe_exceed.iterrows():
+    print(f"{time} — Potential Energy: {row['PE']:.2f}")
+
+
+print("\nKinetic Energy exceedances:")
+for time, row in ke_exceed.iterrows():
+    print(f"{time} — Kinetic Energy: {row['KE']:.2f}")
+
+def energy_phase(row, pe_thresh=2.0, ke_thresh=2.0):
+    if row['PE'] > pe_thresh and row['KE'] < ke_thresh:
+        return "⚡ Setup forming (PE only)"
+    elif row['PE'] > pe_thresh and row['KE'] > ke_thresh:
+        return "🔥 Breakout (PE & KE)"
+    elif row['PE'] < pe_thresh and row['KE'] > ke_thresh:
+        return "⚠️ Overextension (KE only)"
+    else:
+        return "✅ Calm/No signal"
+
+lookback = 30   # Rolling window for variance
+z_window = 50   # Rolling window for z-score
+
+# Define the spring constant (inverse of variance of spread)
+df['k'] = 1 / df['spread'].rolling(lookback).var().replace(0, 1e-8)
+
+# Elastic Potential Energy
+df['EPE'] = 0.5 * df['k'] * (df['spread'] ** 2)
+
+# Z-score normalization of EPE
+df['EPE_z'] = (df['EPE'] - df['EPE'].rolling(z_window).mean()) / df['EPE'].rolling(z_window).std().replace(0, 1e-8)
