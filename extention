@@ -1,0 +1,997 @@
+!pip install ccxt
+!pip install pykalman
+
+
+import ccxt
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from pykalman import KalmanFilter
+from statsmodels.tsa.stattools import adfuller, kpss
+from sklearn.preprocessing import PowerTransformer
+from scipy.signal import savgol_filter
+import warnings
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+from datetime import datetime, timedelta
+import seaborn as sns
+warnings.filterwarnings('ignore')
+
+# === EXCHANGE INIT ===
+exchange = ccxt.kucoin()
+
+# === FETCH FUNCTION ===
+def fetch_data(symbol, timeframe='5m', limit=15000):
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high','low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
+    return df[['close', 'volume']]
+
+# === CLEANING FUNCTION ===
+def auto_clean(df):
+    df = df.interpolate(method='linear')
+    df = df.fillna(method='ffill')
+    df = df.fillna(method='bfill')
+    return df
+
+# === KALMAN FILTER HEDGE RATIO ESTIMATION ===
+def kalman_filter_hedge_ratio(y, x):
+    delta = 1e-10
+    trans_cov = delta / (1 - delta) * np.eye(2)
+    obs_mat = np.vstack([x, np.ones(len(x))]).T[:, np.newaxis, :]
+
+    kf = KalmanFilter(
+        transition_matrices=np.eye(2),
+        observation_matrices=obs_mat,
+        initial_state_mean=[0, 0],
+        initial_state_covariance=np.ones((2, 2)),
+        observation_covariance=1.0,
+        transition_covariance=trans_cov
+    )
+
+    state_means, _ = kf.filter(y.values)
+    hedge_ratios = state_means[:, 0]
+    intercepts = state_means[:, 1]
+    return hedge_ratios, intercepts
+
+@dataclass
+class Position:
+    """Represents a trading position"""
+    entry_time: pd.Timestamp
+    entry_spread: float
+    direction: int  # 1 for long spread, -1 for short spread
+    size: float
+    eth_shares: float
+    btc_shares: float
+    hedge_ratio: float
+    entry_signal_strength: float
+    entry_regime: str
+    max_holding_periods: int = 50  # Maximum periods to hold
+
+    def __post_init__(self):
+        self.current_periods_held = 0
+        self.max_favorable_spread = None
+        self.max_adverse_spread = None
+
+@dataclass
+class Trade:
+    """Represents a completed trade"""
+    entry_time: pd.Timestamp
+    exit_time: pd.Timestamp
+    direction: int
+    entry_spread: float
+    exit_spread: float
+    pnl: float
+    pnl_pct: float
+    holding_periods: int
+    exit_reason: str
+    entry_regime: str
+    signal_strength: float
+    max_favorable: float
+    max_adverse: float
+
+class EnhancedPhysicsTrading:
+    """Enhanced physics-based trading system"""
+
+    def __init__(self, lookback_window=20, zscore_window=50):
+        self.lookback = lookback_window
+        self.zscore_window = zscore_window
+        self.epsilon = 1e-8
+
+    def calculate_spring_dynamics(self, df):
+        """Calculate spring constant and related dynamics"""
+        result = df.copy()
+
+        if 'k' not in result.columns:
+            result['k'] = 1 / result['spread'].rolling(self.lookback).var().replace(0, self.epsilon)
+
+        vol_regime = result['spread'].rolling(self.lookback).std()
+        vol_regime_norm = (vol_regime - vol_regime.rolling(self.zscore_window).mean()) / vol_regime.rolling(self.zscore_window).std().replace(0, self.epsilon)
+        result['k_adaptive'] = result['k'] / (1 + 0.5 * vol_regime_norm.abs())
+
+        return result
+
+    def calculate_market_mass(self, df):
+        """Calculate market mass using volume data"""
+        if 'eth_volume' in df.columns and 'btc_volume' in df.columns:
+            total_volume = df['eth_volume'] + df['btc_volume']
+            mass = total_volume.rolling(self.lookback).mean()
+        else:
+            mass = 1 / (df['spread'].rolling(self.lookback).std() + self.epsilon)
+
+        return mass.fillna(method='ffill').fillna(1.0)
+
+    def calculate_enhanced_energies(self, df):
+        """Enhanced energy calculations"""
+        result = df.copy()
+
+        if 'velocity' not in result.columns:
+            result['velocity'] = result['spread'].diff().fillna(0)
+        if 'acceleration' not in result.columns:
+            result['acceleration'] = result['velocity'].diff().fillna(0)
+        if 'jerk' not in result.columns:
+            result['jerk'] = result['acceleration'].diff().fillna(0)
+
+        result = self.calculate_spring_dynamics(result)
+        mass = self.calculate_market_mass(result)
+        result['mass'] = mass
+
+        # Elastic Potential Energy
+        result['EPE_adaptive'] = 0.5 * result['k_adaptive'] * (result['spread'] ** 2)
+        epe_mean = result['EPE_adaptive'].rolling(self.zscore_window).mean()
+        epe_std = result['EPE_adaptive'].rolling(self.zscore_window).std().replace(0, self.epsilon)
+        result['EPE_z'] = (result['EPE_adaptive'] - epe_mean) / epe_std
+
+        # Kinetic Energy
+        result['KE_enhanced'] = 0.5 * mass * (result['velocity'] ** 2)
+        ke_mean = result['KE_enhanced'].rolling(self.zscore_window).mean()
+        ke_std = result['KE_enhanced'].rolling(self.zscore_window).std().replace(0, self.epsilon)
+        result['KE_z'] = (result['KE_enhanced'] - ke_mean) / ke_std
+
+        # Damped Restoring Force
+        damping = result['velocity'].rolling(self.lookback).std().replace(0, self.epsilon)
+        result['damping'] = damping
+        result['restoring_force'] = -result['k_adaptive'] * result['spread'] - damping * result['velocity']
+        f_mean = result['restoring_force'].rolling(self.zscore_window).mean()
+        f_std = result['restoring_force'].rolling(self.zscore_window).std().replace(0, self.epsilon)
+        result['F_z'] = (result['restoring_force'] - f_mean) / f_std
+
+        # Energy Phase Ratio
+        result['EPR'] = result['EPE_adaptive'] / (result['KE_enhanced'] + self.epsilon)
+        result['EPR_log'] = np.log(result['EPR'] + self.epsilon)
+        epr_mean = result['EPR_log'].rolling(self.zscore_window).mean()
+        epr_std = result['EPR_log'].rolling(self.zscore_window).std().replace(0, self.epsilon)
+        result['EPR_z'] = (result['EPR_log'] - epr_mean) / epr_std
+
+        # Jerk Energy
+        spread_vol = result['spread'].rolling(self.lookback).std().replace(0, self.epsilon)
+        result['JE'] = result['jerk'].abs() * (result['spread'] ** 2) / spread_vol
+        je_mean = result['JE'].rolling(self.zscore_window).mean()
+        je_std = result['JE'].rolling(self.zscore_window).std().replace(0, self.epsilon)
+        result['JE_z'] = (result['JE'] - je_mean) / je_std
+
+        return result
+
+    def calculate_half_life_metrics(self, df):
+        """Calculate mean reversion timing metrics"""
+        result = df.copy()
+
+        result['half_life'] = np.log(2) / (result['k_adaptive'] + self.epsilon)
+        result['oscillation_period'] = 2 * np.pi * np.sqrt(result['mass'] / (result['k_adaptive'] + self.epsilon))
+        critical_damping = 2 * np.sqrt(result['k_adaptive'] * result['mass'])
+        result['damping_ratio'] = result['damping'] / critical_damping
+
+        result['oscillation_regime'] = np.where(
+            result['damping_ratio'] > 1, 'Overdamped',
+            np.where(result['damping_ratio'] == 1, 'Critical', 'Underdamped')
+        )
+
+        return result
+
+    def detect_energy_regimes(self, df):
+        """Enhanced regime detection"""
+        result = df.copy()
+
+        high_epe_thresh = 1.5
+        high_ke_thresh = 1.0
+        high_jerk_thresh = 2.0
+
+        high_epe = result['EPE_z'] > high_epe_thresh
+        high_ke = result['KE_z'] > high_ke_thresh
+        high_jerk = result['JE_z'] > high_jerk_thresh
+
+        conditions = [
+            high_epe & ~high_ke & ~high_jerk,
+            high_epe & ~high_ke & high_jerk,
+            ~high_epe & high_ke & ~high_jerk,
+            high_epe & high_ke,
+            ~high_epe & ~high_ke & high_jerk,
+        ]
+
+        choices = ['Setup', 'Trigger', 'Impulse', 'Chaos', 'Disturbance']
+        result['energy_regime'] = np.select(conditions, choices, default='Equilibrium')
+
+        return result
+
+    def generate_enhanced_signals(self, df):
+        """Enhanced signal generation"""
+        result = df.copy()
+
+        energy_setup = (result['EPE_z'] > 1.5) & (result['KE_z'] < 0.5)
+        force_extreme = result['F_z'].abs() > 2.0
+        velocity_turning = (result['velocity'] * result['acceleration']) < 0
+        jerk_spike = result['JE_z'] > 2.0
+        favorable_regime = result['oscillation_regime'].isin(['Critical', 'Underdamped'])
+
+        primary_entry = energy_setup & force_extreme & velocity_turning
+        catalyst_entry = energy_setup & jerk_spike
+        entry_signal = (primary_entry | catalyst_entry) & favorable_regime
+
+        result['signal_direction'] = np.where(entry_signal, -np.sign(result['spread']), 0)
+
+        regime_confidence = np.where(result['energy_regime'] == 'Setup', 1.0,
+                           np.where(result['energy_regime'] == 'Trigger', 1.2, 0.5))
+
+        result['signal_strength'] = np.where(
+            entry_signal,
+            result['EPE_z'] * regime_confidence / (result['half_life'] + 1),
+            0
+        )
+
+        energy_released = result['KE_z'] > 1.5
+        force_normalized = result['F_z'].abs() < 0.5
+        result['exit_signal'] = energy_released | force_normalized
+
+        return result
+
+    def run_full_analysis(self, df):
+        """Run complete enhanced analysis"""
+        result = self.calculate_enhanced_energies(df)
+        result = self.calculate_half_life_metrics(result)
+        result = self.detect_energy_regimes(result)
+        result = self.generate_enhanced_signals(result)
+        return result
+
+class PhysicsBacktester:
+    """Comprehensive backtesting framework for physics trading system"""
+
+    def __init__(self,
+                 initial_capital: float = 100000,
+                 position_size: float = 0.1,  # 10% of capital per trade
+                 transaction_costs: float = 0.001,  # 0.1% per leg
+                 max_positions: int = 3,
+                 risk_per_trade: float = 0.02,  # 2% risk per trade
+                 stop_loss_atr_multiple: float = 3.0,
+                 profit_target_multiple: float = 2.0):
+
+        self.initial_capital = initial_capital
+        self.current_capital = initial_capital
+        self.position_size = position_size
+        self.transaction_costs = transaction_costs
+        self.max_positions = max_positions
+        self.risk_per_trade = risk_per_trade
+        self.stop_loss_atr_multiple = stop_loss_atr_multiple
+        self.profit_target_multiple = profit_target_multiple
+
+        # Trading state
+        self.positions: List[Position] = []
+        self.trades: List[Trade] = []
+        self.equity_curve: List[float] = []
+        self.drawdown_curve: List[float] = []
+        self.peak_equity = initial_capital
+
+        # Performance tracking
+        self.daily_returns: List[float] = []
+        self.trade_returns: List[float] = []
+
+    def calculate_position_size(self, current_price: float, atr: float) -> float:
+        """Calculate position size based on risk management"""
+        # Risk-based position sizing
+        risk_amount = self.current_capital * self.risk_per_trade
+        stop_distance = atr * self.stop_loss_atr_multiple
+
+        if stop_distance > 0:
+            shares = risk_amount / stop_distance
+            max_shares = (self.current_capital * self.position_size) / current_price
+            return min(shares, max_shares)
+        else:
+            return (self.current_capital * self.position_size) / current_price
+
+    def calculate_transaction_costs(self, eth_notional: float, btc_notional: float) -> float:
+        """Calculate total transaction costs for pair trade"""
+        return (abs(eth_notional) + abs(btc_notional)) * self.transaction_costs
+
+    def enter_position(self,
+                      timestamp: pd.Timestamp,
+                      spread: float,
+                      direction: int,
+                      eth_price: float,
+                      btc_price: float,
+                      hedge_ratio: float,
+                      signal_strength: float,
+                      regime: str,
+                      atr: float) -> bool:
+        """Enter a new pairs trading position with proper hedging"""
+
+        if len(self.positions) >= self.max_positions:
+            return False
+
+        # Calculate position size based on spread volatility and capital allocation
+        # Use a fixed dollar amount for the "unit" position size
+        position_capital = self.current_capital * self.position_size
+
+        # For pairs trading, we need to determine the notional size
+        # The spread = ETH - hedge_ratio * BTC
+        # If we're long the spread: Buy ETH, Sell hedge_ratio * BTC
+        # If we're short the spread: Sell ETH, Buy hedge_ratio * BTC
+
+        # Calculate the dollar neutral position size
+        # Total notional should be approximately position_capital
+        eth_notional_per_unit = eth_price
+        btc_notional_per_unit = hedge_ratio * btc_price
+        total_notional_per_unit = eth_notional_per_unit + btc_notional_per_unit
+
+        # Number of "units" we can afford
+        units = position_capital / total_notional_per_unit
+
+        # Apply risk-based sizing if ATR is available
+        if atr > 0:
+            risk_amount = self.current_capital * self.risk_per_trade
+            stop_distance = atr * self.stop_loss_atr_multiple
+            max_units_by_risk = risk_amount / stop_distance
+            units = min(units, max_units_by_risk)
+
+        # Calculate actual shares for the pair
+        if direction > 0:  # Long spread: Long ETH, Short BTC
+            eth_shares = units
+            btc_shares = -units * hedge_ratio
+        else:  # Short spread: Short ETH, Long BTC
+            eth_shares = -units
+            btc_shares = units * hedge_ratio
+
+        # Calculate actual notional values
+        eth_notional = eth_shares * eth_price
+        btc_notional = btc_shares * btc_price
+
+        # Calculate transaction costs (both legs)
+        transaction_cost = self.calculate_transaction_costs(eth_notional, btc_notional)
+
+        # Check capital adequacy (for margin/collateral)
+        total_gross_notional = abs(eth_notional) + abs(btc_notional)
+        required_capital = total_gross_notional * 0.3 + transaction_cost  # 30% margin requirement
+
+        if required_capital > self.current_capital * 0.95:  # 5% buffer
+            return False
+
+        # Create position
+        position = Position(
+            entry_time=timestamp,
+            entry_spread=spread,
+            direction=direction,
+            size=units,  # Store the number of units
+            eth_shares=eth_shares,
+            btc_shares=btc_shares,
+            hedge_ratio=hedge_ratio,
+            entry_signal_strength=signal_strength,
+            entry_regime=regime
+        )
+
+        self.positions.append(position)
+
+        # Deduct transaction costs and margin
+        self.current_capital -= transaction_cost
+        # Note: In a real implementation, you'd track margin requirements separately
+
+        return True
+
+    def exit_position(self,
+                     position: Position,
+                     timestamp: pd.Timestamp,
+                     spread: float,
+                     eth_price: float,
+                     btc_price: float,
+                     exit_reason: str) -> Trade:
+        """Exit a pairs trading position and calculate P&L correctly"""
+
+        # Calculate P&L from the spread movement
+        # P&L = direction * (exit_spread - entry_spread) * position_size
+        spread_change = spread - position.entry_spread
+        spread_pnl = position.direction * spread_change * position.size
+
+        # Alternative calculation using individual legs (should be equivalent)
+        # Current value of ETH position
+        eth_current_value = position.eth_shares * eth_price
+        # Current value of BTC position
+        btc_current_value = position.btc_shares * btc_price
+
+        # Entry values
+        eth_entry_price = (position.entry_spread + position.hedge_ratio * btc_price) if position.direction > 0 else eth_price  # Approximate
+        # More accurate: back-calculate entry prices from the position
+
+        # For pairs trading P&L, we care about the spread P&L
+        # The hedge should make us dollar-neutral to individual price moves
+
+        # Calculate transaction costs for exit
+        eth_notional = abs(position.eth_shares * eth_price)
+        btc_notional = abs(position.btc_shares * btc_price)
+        exit_transaction_cost = self.calculate_transaction_costs(eth_notional, btc_notional)
+
+        # Net P&L after costs
+        net_pnl = spread_pnl - exit_transaction_cost
+
+        # Calculate percentage return based on initial capital deployed
+        initial_capital_deployed = (abs(position.eth_shares * eth_price) + abs(position.btc_shares * btc_price)) * 0.3  # Margin
+        pnl_pct = net_pnl / initial_capital_deployed if initial_capital_deployed > 0 else 0
+
+        # Update capital
+        self.current_capital += net_pnl
+
+        # Create trade record
+        trade = Trade(
+            entry_time=position.entry_time,
+            exit_time=timestamp,
+            direction=position.direction,
+            entry_spread=position.entry_spread,
+            exit_spread=spread,
+            pnl=net_pnl,
+            pnl_pct=pnl_pct,
+            holding_periods=position.current_periods_held,
+            exit_reason=exit_reason,
+            entry_regime=position.entry_regime,
+            signal_strength=position.entry_signal_strength,
+            max_favorable=position.max_favorable_spread or spread,
+            max_adverse=position.max_adverse_spread or spread
+        )
+
+        self.trades.append(trade)
+        self.trade_returns.append(pnl_pct)
+
+        return trade
+
+    def update_positions(self,
+                        timestamp: pd.Timestamp,
+                        spread: float,
+                        eth_price: float,
+                        btc_price: float,
+                        exit_signal: bool,
+                        atr: float):
+        """Update existing positions and check exit conditions"""
+
+        positions_to_remove = []
+
+        for position in self.positions:
+            position.current_periods_held += 1
+
+            # Track max favorable/adverse moves for the spread
+            if position.direction > 0:  # Long spread
+                if position.max_favorable_spread is None or spread > position.max_favorable_spread:
+                    position.max_favorable_spread = spread
+                if position.max_adverse_spread is None or spread < position.max_adverse_spread:
+                    position.max_adverse_spread = spread
+            else:  # Short spread
+                if position.max_favorable_spread is None or spread < position.max_favorable_spread:
+                    position.max_favorable_spread = spread
+                if position.max_adverse_spread is None or spread > position.max_adverse_spread:
+                    position.max_adverse_spread = spread
+
+            # Check exit conditions
+            exit_reason = None
+
+            # 1. Signal-based exit
+            if exit_signal:
+                exit_reason = "Signal Exit"
+
+            # 2. Stop loss (spread-based, using ATR)
+            elif atr > 0:
+                stop_distance = atr * self.stop_loss_atr_multiple
+                if position.direction > 0 and spread < (position.entry_spread - stop_distance):
+                    exit_reason = "Stop Loss"
+                elif position.direction < 0 and spread > (position.entry_spread + stop_distance):
+                    exit_reason = "Stop Loss"
+
+            # 3. Profit target (spread-based)
+            elif atr > 0:
+                profit_distance = atr * self.profit_target_multiple
+                if position.direction > 0 and spread > (position.entry_spread + profit_distance):
+                    exit_reason = "Profit Target"
+                elif position.direction < 0 and spread < (position.entry_spread - profit_distance):
+                    exit_reason = "Profit Target"
+
+            # 4. Maximum holding period
+            elif position.current_periods_held >= position.max_holding_periods:
+                exit_reason = "Max Hold Period"
+
+            # 5. Mean reversion (spread crosses zero in favorable direction)
+            elif (position.direction > 0 and position.entry_spread < 0 and spread > 0) or \
+                 (position.direction < 0 and position.entry_spread > 0 and spread < 0):
+                exit_reason = "Mean Reversion"
+
+            if exit_reason:
+                positions_to_remove.append((position, exit_reason))
+
+        # Exit positions with proper prices
+        for position, exit_reason in positions_to_remove:
+            self.exit_position(position, timestamp, spread, eth_price, btc_price, exit_reason)
+            self.positions.remove(position)
+
+    def run_backtest(self, df: pd.DataFrame, physics_system: EnhancedPhysicsTrading) -> pd.DataFrame:
+        """Run the complete backtest"""
+
+        print("Running Enhanced Physics Backtest...")
+
+        # Run physics analysis
+        analyzed_df = physics_system.run_full_analysis(df)
+
+        # Calculate ATR for risk management
+        analyzed_df['spread_range'] = abs(analyzed_df['spread'].diff())
+        analyzed_df['atr'] = analyzed_df['spread_range'].rolling(14).mean()
+
+        # Initialize tracking
+        self.equity_curve = []
+        self.drawdown_curve = []
+
+        # Backtest loop
+        for i, (timestamp, row) in enumerate(analyzed_df.iterrows()):
+
+            if i < max(physics_system.lookback, physics_system.zscore_window) + 20:
+                continue  # Skip initial periods
+
+            # Update existing positions
+            if len(self.positions) > 0:
+                self.update_positions(
+                    timestamp=timestamp,
+                    spread=row['spread'],
+                    eth_price=row['eth'],
+                    btc_price=row['btc'],
+                    exit_signal=row['exit_signal'],
+                    atr=row['atr']
+                )
+
+            # Check for new entry signals
+            if row['signal_direction'] != 0 and not np.isnan(row['signal_strength']):
+                success = self.enter_position(
+                    timestamp=timestamp,
+                    spread=row['spread'],
+                    direction=int(row['signal_direction']),
+                    eth_price=row['eth'],
+                    btc_price=row['btc'],
+                    hedge_ratio=row['hedge_ratio'],
+                    signal_strength=row['signal_strength'],
+                    regime=row['energy_regime'],
+                    atr=row['atr']
+                )
+
+            # Track equity curve
+            total_equity = self.current_capital
+
+            # Add unrealized P&L from open positions (properly calculated for pairs)
+            for position in self.positions:
+                # Unrealized P&L = direction * (current_spread - entry_spread) * position_size
+                spread_change = row['spread'] - position.entry_spread
+                unrealized_pnl = position.direction * spread_change * position.size
+                total_equity += unrealized_pnl
+
+            self.equity_curve.append(total_equity)
+
+            # Track drawdown
+            if total_equity > self.peak_equity:
+                self.peak_equity = total_equity
+            drawdown = (self.peak_equity - total_equity) / self.peak_equity
+            self.drawdown_curve.append(drawdown)
+
+        # Create results dataframe
+        results_df = analyzed_df.copy()
+        results_df['equity'] = np.nan
+        results_df['drawdown'] = np.nan
+
+        start_idx = max(physics_system.lookback, physics_system.zscore_window) + 20
+        end_idx = start_idx + len(self.equity_curve)
+
+        if end_idx <= len(results_df):
+            results_df.iloc[start_idx:end_idx, results_df.columns.get_loc('equity')] = self.equity_curve
+            results_df.iloc[start_idx:end_idx, results_df.columns.get_loc('drawdown')] = self.drawdown_curve
+
+        print(f"Backtest completed. Total trades: {len(self.trades)}")
+
+        return results_df
+
+    def get_performance_metrics(self) -> Dict:
+        """Calculate comprehensive performance metrics"""
+
+        if len(self.trades) == 0:
+            return {"error": "No trades executed"}
+
+        # Basic metrics
+        total_return = (self.current_capital - self.initial_capital) / self.initial_capital
+
+        # Trade statistics
+        winning_trades = [t for t in self.trades if t.pnl > 0]
+        losing_trades = [t for t in self.trades if t.pnl <= 0]
+
+        win_rate = len(winning_trades) / len(self.trades) if self.trades else 0
+
+        avg_win = np.mean([t.pnl for t in winning_trades]) if winning_trades else 0
+        avg_loss = np.mean([t.pnl for t in losing_trades]) if losing_trades else 0
+
+        # Risk metrics
+        if len(self.equity_curve) > 1:
+            returns = np.diff(self.equity_curve) / self.equity_curve[:-1]
+            sharpe_ratio = np.mean(returns) / np.std(returns) * np.sqrt(252) if np.std(returns) > 0 else 0
+            max_drawdown = max(self.drawdown_curve) if self.drawdown_curve else 0
+        else:
+            sharpe_ratio = 0
+            max_drawdown = 0
+
+        # Trade duration
+        avg_holding_periods = np.mean([t.holding_periods for t in self.trades])
+
+        return {
+            'total_return': total_return,
+            'total_trades': len(self.trades),
+            'winning_trades': len(winning_trades),
+            'losing_trades': len(losing_trades),
+            'win_rate': win_rate,
+            'avg_win': avg_win,
+            'avg_loss': avg_loss,
+            'profit_factor': abs(avg_win / avg_loss) if avg_loss != 0 else float('inf'),
+            'sharpe_ratio': sharpe_ratio,
+            'max_drawdown': max_drawdown,
+            'avg_holding_periods': avg_holding_periods,
+            'final_capital': self.current_capital
+        }
+
+    def plot_results(self, results_df: pd.DataFrame):
+        """Create comprehensive performance plots"""
+
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+        # Plot 1: Equity curve and drawdown
+        ax1 = axes[0, 0]
+        valid_equity = results_df['equity'].dropna()
+        valid_drawdown = results_df['drawdown'].dropna()
+
+        if len(valid_equity) > 0:
+            ax1.plot(valid_equity.index, valid_equity.values, label='Portfolio Equity', color='blue')
+            ax1.axhline(self.initial_capital, color='gray', linestyle='--', alpha=0.7, label='Initial Capital')
+            ax1_twin = ax1.twinx()
+            ax1_twin.fill_between(valid_drawdown.index, valid_drawdown.values, 0,
+                                 alpha=0.3, color='red', label='Drawdown')
+            ax1_twin.set_ylabel('Drawdown', color='red')
+
+        ax1.set_title('Portfolio Performance')
+        ax1.set_ylabel('Portfolio Value ($)')
+        ax1.legend(loc='upper left')
+        ax1.grid(True, alpha=0.3)
+
+        # Plot 2: Spread and signals
+        ax2 = axes[0, 1]
+        ax2.plot(results_df.index, results_df['spread'], label='Spread', color='purple', alpha=0.7)
+
+        # Mark trades
+        for trade in self.trades:
+            color = 'green' if trade.pnl > 0 else 'red'
+            ax2.scatter(trade.entry_time, trade.entry_spread, color=color, s=50, alpha=0.8)
+            ax2.scatter(trade.exit_time, trade.exit_spread, color=color, s=30, marker='x', alpha=0.8)
+
+        ax2.axhline(0, color='gray', linestyle='--', alpha=0.5)
+        ax2.set_title('Trading Signals on Spread')
+        ax2.set_ylabel('Spread')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+
+        # Plot 3: Trade P&L distribution
+        ax3 = axes[1, 0]
+        if self.trades:
+            pnl_values = [t.pnl for t in self.trades]
+            ax3.hist(pnl_values, bins=20, alpha=0.7, color='skyblue', edgecolor='black')
+            ax3.axvline(0, color='red', linestyle='--', alpha=0.7)
+            ax3.set_title('Trade P&L Distribution')
+            ax3.set_xlabel('P&L ($)')
+            ax3.set_ylabel('Frequency')
+            ax3.grid(True, alpha=0.3)
+
+        # Plot 4: Performance metrics by regime
+        ax4 = axes[1, 1]
+        if self.trades:
+            regime_pnl = {}
+            for trade in self.trades:
+                if trade.entry_regime not in regime_pnl:
+                    regime_pnl[trade.entry_regime] = []
+                regime_pnl[trade.entry_regime].append(trade.pnl)
+
+            regimes = list(regime_pnl.keys())
+            avg_pnl = [np.mean(regime_pnl[regime]) for regime in regimes]
+
+            bars = ax4.bar(regimes, avg_pnl, alpha=0.7)
+            for i, bar in enumerate(bars):
+                bar.set_color('green' if avg_pnl[i] > 0 else 'red')
+
+            ax4.axhline(0, color='black', linestyle='-', alpha=0.5)
+            ax4.set_title('Average P&L by Entry Regime')
+            ax4.set_ylabel('Average P&L ($)')
+            ax4.tick_params(axis='x', rotation=45)
+            ax4.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+    def generate_trade_report(self) -> pd.DataFrame:
+        """Generate detailed trade report"""
+
+        if not self.trades:
+            return pd.DataFrame()
+
+        trade_data = []
+        for trade in self.trades:
+            trade_data.append({
+                'entry_time': trade.entry_time,
+                'exit_time': trade.exit_time,
+                'direction': 'Long' if trade.direction > 0 else 'Short',
+                'entry_spread': trade.entry_spread,
+                'exit_spread': trade.exit_spread,
+                'pnl': trade.pnl,
+                'pnl_pct': trade.pnl_pct * 100,
+                'holding_periods': trade.holding_periods,
+                'exit_reason': trade.exit_reason,
+                'entry_regime': trade.entry_regime,
+                'signal_strength': trade.signal_strength,
+                'max_favorable': trade.max_favorable,
+                'max_adverse': trade.max_adverse
+            })
+
+        return pd.DataFrame(trade_data)
+
+# === MAIN EXECUTION WITH BACKTEST ===
+if __name__ == "__main__":
+    print("Starting Enhanced Physics Trading Backtest...")
+    print("="*60)
+
+    # Fetch and prepare data
+    print("1. Fetching market data...")
+    btc = auto_clean(fetch_data('BTC-USDT', timeframe='4h', limit=200000))
+    eth = auto_clean(fetch_data('ETH-USDT', timeframe='4h', limit=200000))
+
+    btc.rename(columns={'close': 'btc', 'volume': 'btc_volume'}, inplace=True)
+    eth.rename(columns={'close': 'eth', 'volume': 'eth_volume'}, inplace=True)
+
+    df = eth.join(btc, how='inner')
+    print(f"Data loaded: {len(df)} periods from {df.index[0]} to {df.index[-1]}")
+
+    # Apply Kalman Filter
+    print("2. Applying Kalman Filter for hedge ratio...")
+    hedge_ratios, intercepts = kalman_filter_hedge_ratio(df['eth'], df['btc'])
+    df['hedge_ratio'] = hedge_ratios
+    df['intercept'] = intercepts
+    df['spread'] = df['eth'] - (df['hedge_ratio'] * df['btc'] + df['intercept'])
+
+    # Initialize systems
+    print("3. Initializing trading systems...")
+    physics_system = EnhancedPhysicsTrading(lookback_window=30, zscore_window=50)
+
+    # Configure backtest parameters
+    backtest_config = {
+        'initial_capital': 100000,
+        'position_size': 0.2,  # 20% of capital per trade
+        'transaction_costs': 0.001,  # 0.1% per leg
+        'max_positions': 2,
+        'risk_per_trade': 0.02,  # 2% risk per trade
+        'stop_loss_atr_multiple': 2.5,
+        'profit_target_multiple': 3.0
+    }
+
+    backtester = PhysicsBacktester(**backtest_config)
+
+    # Run backtest
+    print("4. Running backtest...")
+    results_df = backtester.run_backtest(df, physics_system)
+
+    # Generate performance report
+    print("5. Analyzing results...")
+    performance = backtester.get_performance_metrics()
+    trade_report = backtester.generate_trade_report()
+
+    # Display results
+    print("\n" + "="*60)
+    print("BACKTEST RESULTS SUMMARY")
+    print("="*60)
+
+    print(f"Initial Capital: ${performance.get('final_capital', 0):,.2f}")
+    print(f"Final Capital: ${performance.get('final_capital', 0):,.2f}")
+    print(f"Total Return: {performance.get('total_return', 0)*100:.2f}%")
+    print(f"Total Trades: {performance.get('total_trades', 0)}")
+    print(f"Win Rate: {performance.get('win_rate', 0)*100:.1f}%")
+    print(f"Average Win: ${performance.get('avg_win', 0):.2f}")
+    print(f"Average Loss: ${performance.get('avg_loss', 0):.2f}")
+    print(f"Profit Factor: {performance.get('profit_factor', 0):.2f}")
+    print(f"Sharpe Ratio: {performance.get('sharpe_ratio', 0):.2f}")
+    print(f"Max Drawdown: {performance.get('max_drawdown', 0)*100:.2f}%")
+    print(f"Avg Holding Periods: {performance.get('avg_holding_periods', 0):.1f}")
+
+    # Trade breakdown by regime
+    if len(trade_report) > 0:
+        print("\nTRADE BREAKDOWN BY ENTRY REGIME:")
+        print("-" * 40)
+        regime_stats = trade_report.groupby('entry_regime').agg({
+            'pnl': ['count', 'mean', 'sum'],
+            'pnl_pct': 'mean',
+            'holding_periods': 'mean'
+        }).round(2)
+        print(regime_stats)
+
+        print("\nRECENT TRADES:")
+        print("-" * 40)
+        recent_trades = trade_report.tail(10)[['entry_time', 'direction', 'entry_regime',
+                                              'pnl', 'pnl_pct', 'exit_reason']].round(2)
+        print(recent_trades.to_string(index=False))
+
+    # Advanced Analytics
+    print("\n" + "="*60)
+    print("ADVANCED ANALYTICS")
+    print("="*60)
+
+    if len(backtester.trades) > 0:
+        # Regime performance analysis
+        regime_performance = {}
+        for trade in backtester.trades:
+            regime = trade.entry_regime
+            if regime not in regime_performance:
+                regime_performance[regime] = {'trades': [], 'pnl': []}
+            regime_performance[regime]['trades'].append(trade)
+            regime_performance[regime]['pnl'].append(trade.pnl)
+
+        print("\nPERFORMANCE BY ENERGY REGIME:")
+        for regime, data in regime_performance.items():
+            trades = data['trades']
+            pnl_list = data['pnl']
+            win_rate = sum(1 for p in pnl_list if p > 0) / len(pnl_list) * 100
+            avg_pnl = np.mean(pnl_list)
+            total_pnl = sum(pnl_list)
+
+            print(f"{regime:12}: {len(trades):3} trades, "
+                  f"{win_rate:5.1f}% win rate, "
+                  f"${avg_pnl:7.2f} avg, "
+                  f"${total_pnl:8.2f} total")
+
+        # Exit reason analysis
+        exit_reasons = {}
+        for trade in backtester.trades:
+            reason = trade.exit_reason
+            if reason not in exit_reasons:
+                exit_reasons[reason] = []
+            exit_reasons[reason].append(trade.pnl)
+
+        print("\nPERFORMANCE BY EXIT REASON:")
+        for reason, pnl_list in exit_reasons.items():
+            win_rate = sum(1 for p in pnl_list if p > 0) / len(pnl_list) * 100
+            avg_pnl = np.mean(pnl_list)
+            print(f"{reason:15}: {len(pnl_list):3} trades, "
+                  f"{win_rate:5.1f}% win rate, "
+                  f"${avg_pnl:7.2f} avg")
+
+        # Monthly performance
+        if len(trade_report) > 0:
+            trade_report['entry_month'] = pd.to_datetime(trade_report['entry_time']).dt.to_period('M')
+            monthly_performance = trade_report.groupby('entry_month')['pnl'].agg(['count', 'sum', 'mean']).round(2)
+            monthly_performance.columns = ['Trades', 'Total P&L', 'Avg P&L']
+
+            print("\nMONTHLY PERFORMANCE:")
+            print(monthly_performance.tail(6).to_string())
+
+    # Plot results
+    print("\n6. Generating performance charts...")
+    backtester.plot_results(results_df)
+
+    # Additional diagnostic plots
+    plt.figure(figsize=(16, 10))
+
+    # Plot 1: Signal strength vs P&L
+    plt.subplot(2, 3, 1)
+    if len(trade_report) > 0:
+        plt.scatter(trade_report['signal_strength'], trade_report['pnl'],
+                   c=trade_report['pnl'], cmap='RdYlGn', alpha=0.7)
+        plt.xlabel('Signal Strength')
+        plt.ylabel('Trade P&L ($)')
+        plt.title('Signal Strength vs Trade P&L')
+        plt.colorbar(label='P&L ($)')
+        plt.grid(True, alpha=0.3)
+
+    # Plot 2: Holding period vs P&L
+    plt.subplot(2, 3, 2)
+    if len(trade_report) > 0:
+        plt.scatter(trade_report['holding_periods'], trade_report['pnl'],
+                   c=trade_report['pnl'], cmap='RdYlGn', alpha=0.7)
+        plt.xlabel('Holding Periods')
+        plt.ylabel('Trade P&L ($)')
+        plt.title('Holding Period vs Trade P&L')
+        plt.grid(True, alpha=0.3)
+
+    # Plot 3: Entry regime pie chart
+    plt.subplot(2, 3, 3)
+    if len(trade_report) > 0:
+        regime_counts = trade_report['entry_regime'].value_counts()
+        plt.pie(regime_counts.values, labels=regime_counts.index, autopct='%1.1f%%')
+        plt.title('Trade Distribution by Entry Regime')
+
+    # Plot 4: Rolling Sharpe ratio
+    plt.subplot(2, 3, 4)
+    if len(backtester.equity_curve) > 30:
+        returns = np.diff(backtester.equity_curve) / backtester.equity_curve[:-1]
+        rolling_sharpe = []
+        window = 30
+        for i in range(window, len(returns)):
+            period_returns = returns[i-window:i]
+            if np.std(period_returns) > 0:
+                sharpe = np.mean(period_returns) / np.std(period_returns) * np.sqrt(252)
+            else:
+                sharpe = 0
+            rolling_sharpe.append(sharpe)
+
+        if rolling_sharpe:
+            plt.plot(rolling_sharpe)
+            plt.axhline(0, color='red', linestyle='--', alpha=0.5)
+            plt.title('Rolling 30-Period Sharpe Ratio')
+            plt.ylabel('Sharpe Ratio')
+            plt.grid(True, alpha=0.3)
+
+    # Plot 5: Cumulative returns by regime
+    plt.subplot(2, 3, 5)
+    if len(trade_report) > 0:
+        for regime in trade_report['entry_regime'].unique():
+            regime_trades = trade_report[trade_report['entry_regime'] == regime].sort_values('entry_time')
+            cumulative_pnl = regime_trades['pnl'].cumsum()
+            plt.plot(range(len(cumulative_pnl)), cumulative_pnl, label=regime, marker='o', markersize=3)
+
+        plt.title('Cumulative P&L by Entry Regime')
+        plt.xlabel('Trade Number')
+        plt.ylabel('Cumulative P&L ($)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+    # Plot 6: Win rate by signal strength
+    plt.subplot(2, 3, 6)
+    if len(trade_report) > 0:
+        # Bin signal strengths
+        trade_report['strength_bin'] = pd.cut(trade_report['signal_strength'], bins=5)
+        strength_performance = trade_report.groupby('strength_bin').agg({
+            'pnl': lambda x: (x > 0).mean() * 100  # Win rate
+        })
+
+        if not strength_performance.empty:
+            strength_performance.plot(kind='bar', rot=45)
+            plt.title('Win Rate by Signal Strength')
+            plt.ylabel('Win Rate (%)')
+            plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+    # Save results
+    print("\n7. Saving results...")
+
+    # Save trade report
+    if len(trade_report) > 0:
+        trade_report.to_csv('physics_trading_trades.csv', index=False)
+        print("Trade report saved to 'physics_trading_trades.csv'")
+
+    # Save performance summary
+    with open('physics_trading_summary.txt', 'w') as f:
+        f.write("Enhanced Physics Trading Backtest Summary\n")
+        f.write("="*50 + "\n\n")
+
+        for key, value in performance.items():
+            if isinstance(value, float):
+                if 'rate' in key or 'return' in key:
+                    f.write(f"{key}: {value*100:.2f}%\n")
+                else:
+                    f.write(f"{key}: {value:.4f}\n")
+            else:
+                f.write(f"{key}: {value}\n")
+
+        f.write(f"\nBacktest Period: {df.index[0]} to {df.index[-1]}\n")
+        f.write(f"Total Periods: {len(df)}\n")
+        f.write(f"Configuration: {backtest_config}\n")
+
+    print("Performance summary saved to 'physics_trading_summary.txt'")
+    print("\nBacktest completed successfully!")
+    print("="*60)
